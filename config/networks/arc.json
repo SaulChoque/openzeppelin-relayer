@@ -1,0 +1,26 @@
+{
+  "networks": [
+    {
+      "average_blocktime_ms": 260,
+      "chain_id": 5042002,
+      "explorer_urls": [
+        "https://testnet.arcscan.app"
+      ],
+      "features": [
+        "eip1559"
+      ],
+      "is_testnet": true,
+      "network": "arc-testnet",
+      "required_confirmations": 1,
+      "rpc_urls": [
+        "https://rpc.testnet.arc.network",
+        "https://rpc.blockdaemon.testnet.arc.network",
+        "https://rpc.drpc.testnet.arc.network",
+        "https://rpc.quicknode.testnet.arc.network"
+      ],
+      "symbol": "USDC",
+      "tags": [],
+      "type": "evm"
+    }
+  ]
+}

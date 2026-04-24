@@ -80,7 +80,7 @@
     {
       "id": "notification-example",
       "type": "webhook",
-      "url": "",
+      "url": "https://webhook.site/aec9c7f2-db4b-4a65-a705-dc5486491e2d",
       "signing_key": {
         "type": "env",
         "value": "WEBHOOK_SIGNING_KEY"
