@@ -11,6 +11,28 @@
         "fee_payment_strategy": "relayer",
         "min_balance": 0
       }
+    },
+    {
+      "id": "avalanche-fuji-example",
+      "name": "Avalanche Fuji Example",
+      "network": "avalanche-fuji-testnet",
+      "paused": false,
+      "network_type": "evm",
+      "signer_id": "evm-local-signer",
+      "policies": {
+        "min_balance": 0
+      }
+    },
+    {
+      "id": "hsk-testnet-example",
+      "name": "HSK Testnet Example",
+      "network": "hsk-testnet",
+      "paused": false,
+      "network_type": "evm",
+      "signer_id": "evm-local-signer",
+      "policies": {
+        "min_balance": 0
+      }
     }
   ],
   "notifications": [],
@@ -20,6 +42,17 @@
       "type": "local",
       "config": {
         "path": "config/keys/local-signer.json",
+        "passphrase": {
+          "type": "env",
+          "value": "KEYSTORE_PASSPHRASE"
+        }
+      }
+    },
+    {
+      "id": "evm-local-signer",
+      "type": "local",
+      "config": {
+        "path": "config/keys/evm-local-signer.json",
         "passphrase": {
           "type": "env",
           "value": "KEYSTORE_PASSPHRASE"
@@ -47,6 +80,18 @@
             "assets": [
               "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
             ]
+          },
+          {
+            "network": "eip155:43113",
+            "type": "evm",
+            "relayer_id": "avalanche-fuji-example",
+            "assets": ["0x5425890298aed601595a70AB815c96711a31Bc65"]
+          },
+          {
+            "network": "eip155:133",
+            "type": "evm",
+            "relayer_id": "hsk-testnet-example",
+            "assets": ["0xYourEip3009TokenAddressOnHskTestnet"]
           }
         ]
       }

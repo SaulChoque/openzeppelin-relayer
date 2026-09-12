@@ -20,16 +20,18 @@ cd openzeppelin-relayer/examples/x402-facilitator-plugin
 
 ## Overview
 
-The x402 Facilitator plugin implements the X402 payment facilitation protocol for Stellar. In this Relayer example, it exposes three plugin routes (invoked via `/api/v1/plugins/x402-facilitator/call/{route}`):
+The x402 Facilitator plugin implements the X402 payment facilitation protocol for Stellar and EVM networks. In this Relayer example, it exposes three plugin routes (invoked via `/api/v1/plugins/x402-facilitator/call/{route}`):
 
 - **`verify`**: Verifies a payment payload against payment requirements
 - **`settle`**: Settles a verified payment by submitting the transaction on-chain
 - **`supported`**: Returns supported payment kinds with current max ledger information
 
 The plugin supports:
-- Payment verification with auth entry validation
-- Transaction settlement via relayer API or channel service API
-- Multiple Stellar network configurations
+- Payment verification with auth entry validation (Stellar) or EIP-712 signature recovery (EVM)
+- Transaction settlement via relayer API or channel service API (Stellar), or via `transferWithAuthorization` (EVM, EIP-3009)
+- Multiple Stellar and EVM network configurations
+
+> **EVM support**: `config/config.json` includes example network entries for Avalanche Fuji testnet (`eip155:43113`) and HSK/HashKey Chain testnet (`eip155:133`), matching the `config/networks/avalanche.json` and `config/networks/hsk.json` network definitions in this repo. EVM support requires a version of `@openzeppelin/relayer-plugin-x402-facilitator` with EIP-3009 support — until that's published to npm, point the dependency in `x402-facilitator/package.json` at the fork branch (e.g. `"@openzeppelin/relayer-plugin-x402-facilitator": "github:SaulChoque/relayer-plugin-x402-facilitator#main"`) to try it. See that plugin's README for the `extra.name`/`extra.version` fields EVM payment requirements must include.
 
 ## Setup
 
@@ -76,6 +78,13 @@ cargo run --example create_key -- \
   --password YOUR_PASSWORD \
   --output-dir config/keys \
   --filename local-signer.json
+
+# Only needed if you're also testing the EVM networks (Avalanche Fuji / HSK
+# testnet) configured in config/config.json:
+cargo run --example create_key -- \
+  --password YOUR_PASSWORD \
+  --output-dir config/keys \
+  --filename evm-local-signer.json
 ```
 
 #### Generate API credentials
@@ -102,75 +111,19 @@ API_KEY=<api_key_from_above>
 ### 3. Configure Plugin
 
 The `config/config.json` file already contains the relayer and plugin definitions.
-The x402 facilitator plugin is configured for the `stellar-example` relayer on the Stellar testnet with USDC support.
-
-```json
-{
-  "relayers": [
-    {
-      "id": "stellar-example",
-      "name": "Stellar Example",
-      "network": "testnet",
-      "paused": false,
-      "network_type": "stellar",
-      "signer_id": "local-signer",
-      "policies": {
-        "fee_payment_strategy": "relayer",
-        "min_balance": 0
-      }
-    }
-  ],
-  "notifications": [],
-  "signers": [
-    {
-      "id": "local-signer",
-      "type": "local",
-      "config": {
-        "path": "config/keys/local-signer.json",
-        "passphrase": {
-          "type": "env",
-          "value": "KEYSTORE_PASSPHRASE"
-        }
-      }
-    }
-  ],
-  "networks": "./config/networks",
-  "plugins": [
-    {
-      "id": "x402-facilitator",
-      "path": "x402-facilitator/index.ts",
-      "timeout": 30,
-      "emit_logs": false,
-      "emit_traces": false,
-      "forward_logs": true,
-      "raw_response": true,
-      "allow_get_invocation": true,
-      "config": {
-        "networks": [
-          {
-            "network": "stellar:testnet",
-            "type": "stellar",
-            "relayer_id": "stellar-example",
-            "assets": [
-              "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
-            ]
-          }
-        ]
-      }
-    }
-  ]
-}
-```
+The x402 facilitator plugin is configured for the `stellar-example` relayer on the Stellar testnet with USDC support, plus two EVM relayers for Avalanche Fuji testnet and HSK (HashKey Chain) testnet — see the full file for the exact definitions.
 
 **Plugin Configuration Options:**
 
 - `networks`: Array of network configurations
-  - `type`: Network type (e.g., "stellar")
-  - `network`: Network identifier (e.g., "stellar:testnet", "stellar:pubnet")
+  - `type`: Network type (`"stellar"` or `"evm"`)
+  - `network`: Network identifier — `stellar:testnet`/`stellar:pubnet` for Stellar, or CAIP-2 `eip155:<chainId>` for EVM (e.g. `eip155:43113` for Avalanche Fuji, `eip155:133` for HSK testnet)
   - `relayer_id`: ID of the relayer to use for this network
-  - `assets`: Array of supported asset contract addresses
-  - `channel_service_api_url` (optional): Channel service API URL for settlement
-  - `channel_service_api_key` (optional): Channel service API key
+  - `assets`: Array of supported asset contract addresses (issuer/contract addresses for Stellar, EIP-3009 token contract addresses for EVM)
+  - `channel_service_api_url` (optional, Stellar only): Channel service API URL for settlement
+  - `channel_service_api_key` (optional, Stellar only): Channel service API key
+
+For EVM, the client's `paymentRequirements.extra` must also include the token's EIP-712 domain `name`/`version` — see the plugin's own README for details.
 
 
 ### 4. Start the Service and Get Account Addresses
