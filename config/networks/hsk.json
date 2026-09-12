@@ -1,0 +1,45 @@
+{
+  "networks": [
+    {
+      "average_blocktime_ms": 2000,
+      "chain_id": 177,
+      "explorer_urls": [
+        "https://hashkey.blockscout.com/api",
+        "https://hashkey.blockscout.com"
+      ],
+      "features": [
+        "eip1559"
+      ],
+      "is_testnet": false,
+      "network": "hsk",
+      "required_confirmations": 1,
+      "rpc_urls": [
+        "https://mainnet.hsk.xyz",
+        "https://hsk-mainnet.alt.technology"
+      ],
+      "symbol": "HSK",
+      "tags": [
+        "rollup"
+      ],
+      "type": "evm"
+    },
+    {
+      "from": "hsk",
+      "type": "evm",
+      "network": "hsk-testnet",
+      "chain_id": 133,
+      "explorer_urls": [
+        "https://testnet-explorer.hskchain.net/api",
+        "https://testnet-explorer.hskchain.net"
+      ],
+      "is_testnet": true,
+      "rpc_urls": [
+        "https://testnet.hsk.xyz",
+        "https://hsk-testnet.alt.technology"
+      ],
+      "tags": [
+        "rollup"
+      ]
+    }
+  ]
+}
