@@ -30,7 +30,7 @@
       ],
       "is_testnet": true,
       "rpc_urls": [
-        "https://api.avax-test.network/ext/bc/C/rpc",
+        "https://api.avax.network/ext/bc/C/rpc",
         "https://avalanche-fuji-c-chain-rpc.publicnode.com"
       ]
     }
