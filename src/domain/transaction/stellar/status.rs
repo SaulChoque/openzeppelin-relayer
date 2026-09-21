@@ -3,9 +3,10 @@
 //! ensuring proper transaction state management and lane cleanup.
 
 use chrono::{DateTime, Utc};
-use soroban_rs::xdr::{
-    Error, Hash, InnerTransactionResultResult, InvokeHostFunctionResult, Limits, OperationResult,
-    OperationResultTr, TransactionEnvelope, TransactionResultResult, WriteXdr,
+use stellar_xdr::{
+    ContractEventBody, DiagnosticEvent, Error, Hash, InnerTransactionResultResult,
+    InvokeHostFunctionResult, Limits, OperationResult, OperationResultTr, ScVal,
+    TransactionEnvelope, TransactionResultResult, WriteXdr,
 };
 use tracing::{debug, info, warn};
 
@@ -289,7 +290,7 @@ where
     pub async fn handle_stellar_success(
         &self,
         tx: TransactionRepoModel,
-        provider_response: soroban_rs::stellar_rpc_client::GetTransactionResponse,
+        provider_response: stellar_rpc_client::GetTransactionResponse,
     ) -> Result<TransactionRepoModel, TransactionError> {
         // Extract the actual fee charged and transaction result from the transaction response
         let updated_network_data =
@@ -337,7 +338,7 @@ where
     pub async fn handle_stellar_failed(
         &self,
         tx: TransactionRepoModel,
-        provider_response: soroban_rs::stellar_rpc_client::GetTransactionResponse,
+        provider_response: stellar_rpc_client::GetTransactionResponse,
     ) -> Result<TransactionRepoModel, TransactionError> {
         let result_code = provider_response
             .result
@@ -371,6 +372,7 @@ where
 
         let fee_charged = provider_response.result.as_ref().map(|r| r.fee_charged);
         let fee_bid = provider_response.envelope.as_ref().map(extract_fee_bid);
+        let contract_error = extract_contract_error(&provider_response.events.diagnostic_events);
 
         warn!(
             tx_id = %tx.id,
@@ -381,11 +383,15 @@ where
             inner_fee_charged,
             fee_charged = ?fee_charged,
             fee_bid = ?fee_bid,
+            contract_error = contract_error.as_deref().unwrap_or("n/a"),
             "stellar transaction failed"
         );
 
-        let status_reason = format!(
-            "Transaction failed on-chain. Provider status: FAILED. Specific XDR reason: {result_code}."
+        let status_reason = format_failure_reason(
+            result_code,
+            inner_result_code,
+            op_result_code,
+            contract_error.as_deref(),
         );
 
         let update_request = TransactionUpdateRequest {
@@ -668,6 +674,121 @@ fn first_failing_op(ops: &[OperationResult]) -> Option<&'static str> {
     }
 }
 
+/// Builds the layered `status_reason` written for a failed Stellar
+/// transaction. Each component is omitted when its source data is unavailable.
+fn format_failure_reason(
+    outer: &str,
+    inner: Option<&str>,
+    op: Option<&str>,
+    contract_error: Option<&str>,
+) -> String {
+    let mut s = format!("Transaction failed on-chain. reason={outer}");
+    if let Some(inner) = inner {
+        s.push_str(" inner=");
+        s.push_str(inner);
+    }
+    if let Some(op) = op {
+        s.push_str(" op=");
+        s.push_str(op);
+    }
+    if let Some(ce) = contract_error {
+        s.push_str(" contract_error=");
+        s.push_str(ce);
+    }
+    s
+}
+
+/// Returns a contract-level error from Soroban diagnostic events, rendered as
+/// `"<TypeName>(<code>)"` with an optional ` message="<text>"` when the same
+/// event carries a sibling `ScVal::String` or `ScVal::Symbol`. Returns `None`
+/// when no `ScVal::Error` is present.
+fn extract_contract_error(events: &[DiagnosticEvent]) -> Option<String> {
+    for evt in events {
+        let ContractEventBody::V0(body) = &evt.event.body;
+        let mut error_str: Option<String> = None;
+        let mut message: Option<String> = None;
+        for v in body.topics.iter().chain(std::iter::once(&body.data)) {
+            scan_scval(v, &mut error_str, &mut message);
+            if error_str.is_some() && message.is_some() {
+                break;
+            }
+        }
+        if let Some(err) = error_str {
+            return Some(match message {
+                Some(m) => format!("{err} message=\"{}\"", sanitize_message(&m)),
+                None => err,
+            });
+        }
+    }
+    None
+}
+
+fn scan_scval(v: &ScVal, error_str: &mut Option<String>, message: &mut Option<String>) {
+    match v {
+        ScVal::Error(e) => {
+            if error_str.is_none() {
+                let payload = match e {
+                    stellar_xdr::ScError::Contract(n) => n.to_string(),
+                    stellar_xdr::ScError::WasmVm(c)
+                    | stellar_xdr::ScError::Context(c)
+                    | stellar_xdr::ScError::Storage(c)
+                    | stellar_xdr::ScError::Object(c)
+                    | stellar_xdr::ScError::Crypto(c)
+                    | stellar_xdr::ScError::Events(c)
+                    | stellar_xdr::ScError::Budget(c)
+                    | stellar_xdr::ScError::Value(c)
+                    | stellar_xdr::ScError::Auth(c) => c.name().to_string(),
+                };
+                *error_str = Some(format!("{}({payload})", e.name()));
+            }
+        }
+        ScVal::String(s) => {
+            if message.is_none() {
+                let bytes: &[u8] = s.as_ref();
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    if !text.is_empty() {
+                        *message = Some(text.to_string());
+                    }
+                }
+            }
+        }
+        ScVal::Symbol(sym) => {
+            if message.is_none() {
+                let bytes: &[u8] = sym.as_ref();
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    // Skip the conventional "error" topic marker.
+                    if !text.is_empty() && text != "error" {
+                        *message = Some(text.to_string());
+                    }
+                }
+            }
+        }
+        ScVal::Vec(Some(items)) => {
+            for inner in items.iter() {
+                scan_scval(inner, error_str, message);
+                if error_str.is_some() && message.is_some() {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_message(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            continue;
+        }
+        if c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,18 +796,22 @@ mod tests {
     use crate::repositories::PaginatedResult;
     use chrono::Duration;
     use mockall::predicate::eq;
-    use soroban_rs::stellar_rpc_client::GetTransactionResponse;
+    use stellar_rpc_client::GetTransactionResponse;
 
     use crate::domain::transaction::stellar::test_helpers::*;
 
     fn dummy_get_transaction_response(status: &str) -> GetTransactionResponse {
         GetTransactionResponse {
+            application_order: None,
+            fee_bump: None,
+            tx_hash: None,
+            created_at: None,
             status: status.to_string(),
             ledger: None,
             envelope: None,
             result: None,
             result_meta: None,
-            events: soroban_rs::stellar_rpc_client::GetTransactionEvents {
+            events: stellar_rpc_client::GetTransactionEvents {
                 contract_events: vec![],
                 diagnostic_events: vec![],
                 transaction_events: vec![],
@@ -698,21 +823,21 @@ mod tests {
         status: &str,
         has_return_value: bool,
     ) -> GetTransactionResponse {
-        use soroban_rs::xdr::{ScVal, SorobanTransactionMeta, TransactionMeta, TransactionMetaV3};
+        use stellar_xdr::{ScVal, SorobanTransactionMeta, TransactionMeta, TransactionMetaV3};
 
         let result_meta = if has_return_value {
             // Create a dummy ScVal for testing (using I32(42) as a simple test value)
             let return_value = ScVal::I32(42);
             Some(TransactionMeta::V3(TransactionMetaV3 {
-                ext: soroban_rs::xdr::ExtensionPoint::V0,
-                tx_changes_before: soroban_rs::xdr::LedgerEntryChanges::default(),
-                operations: soroban_rs::xdr::VecM::default(),
-                tx_changes_after: soroban_rs::xdr::LedgerEntryChanges::default(),
+                ext: stellar_xdr::ExtensionPoint::V0,
+                tx_changes_before: stellar_xdr::LedgerEntryChanges::default(),
+                operations: stellar_xdr::VecM::default(),
+                tx_changes_after: stellar_xdr::LedgerEntryChanges::default(),
                 soroban_meta: Some(SorobanTransactionMeta {
-                    ext: soroban_rs::xdr::SorobanTransactionMetaExt::V0,
+                    ext: stellar_xdr::SorobanTransactionMetaExt::V0,
                     return_value,
-                    events: soroban_rs::xdr::VecM::default(),
-                    diagnostic_events: soroban_rs::xdr::VecM::default(),
+                    events: stellar_xdr::VecM::default(),
+                    diagnostic_events: stellar_xdr::VecM::default(),
                 }),
             }))
         } else {
@@ -720,12 +845,16 @@ mod tests {
         };
 
         GetTransactionResponse {
+            application_order: None,
+            fee_bump: None,
+            tx_hash: None,
+            created_at: None,
             status: status.to_string(),
             ledger: None,
             envelope: None,
             result: None,
             result_meta,
-            events: soroban_rs::stellar_rpc_client::GetTransactionEvents {
+            events: stellar_rpc_client::GetTransactionEvents {
                 contract_events: vec![],
                 diagnostic_events: vec![],
                 transaction_events: vec![],
@@ -756,7 +885,7 @@ mod tests {
             }
             tx_to_handle.status = TransactionStatus::Submitted;
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // 1. Mock provider to return SUCCESS
             mocks
@@ -868,7 +997,7 @@ mod tests {
             }
             tx_to_handle.status = TransactionStatus::Submitted; // Or any status that implies it's being watched
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // 1. Mock provider to return PENDING
             mocks
@@ -928,7 +1057,7 @@ mod tests {
             }
             tx_to_handle.status = TransactionStatus::Submitted;
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // 1. Mock provider to return FAILED
             mocks
@@ -1019,7 +1148,7 @@ mod tests {
             assert!(handled_tx.status_reason.is_some());
             assert_eq!(
                 handled_tx.status_reason.unwrap(),
-                "Transaction failed on-chain. Provider status: FAILED. Specific XDR reason: unknown."
+                "Transaction failed on-chain. reason=unknown"
             );
         }
 
@@ -1040,7 +1169,7 @@ mod tests {
             }
             tx_to_handle.status = TransactionStatus::Submitted;
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // 1. Mock provider to return an error
             mocks
@@ -1167,7 +1296,7 @@ mod tests {
             }
             tx_to_handle.status = TransactionStatus::Submitted;
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // Mock provider to return FAILED (on-chain failure)
             mocks
@@ -1244,7 +1373,7 @@ mod tests {
             }
             tx_to_handle.status = TransactionStatus::Submitted;
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // Mock provider to return SUCCESS
             mocks
@@ -1326,7 +1455,7 @@ mod tests {
             }
             tx_to_handle.status = TransactionStatus::Submitted;
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // Mock provider to return a non-XDR error (won't trigger fallback)
             mocks
@@ -1374,7 +1503,7 @@ mod tests {
             }
             tx_to_handle.status = TransactionStatus::Submitted;
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // Mock provider to return SUCCESS with result_meta containing return_value
             mocks
@@ -1479,7 +1608,7 @@ mod tests {
             }
             tx_to_handle.status = TransactionStatus::Submitted;
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // Mock provider to return SUCCESS without result_meta
             mocks
@@ -1781,7 +1910,7 @@ mod tests {
             }
             tx.status = TransactionStatus::Submitted;
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // Provider returns SUCCESS — triggers a partial_update for confirmation
             mocks
@@ -2073,7 +2202,7 @@ mod tests {
                 stellar_data.hash = Some(hex::encode(tx_hash_bytes));
             }
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // Mock provider to return PENDING status (not SUCCESS or FAILED)
             mocks
@@ -2149,7 +2278,7 @@ mod tests {
                 stellar_data.hash = Some(hex::encode(tx_hash_bytes));
             }
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // Mock provider to return PENDING status (not SUCCESS or FAILED)
             mocks
@@ -2226,7 +2355,7 @@ mod tests {
                 stellar_data.hash = Some(hex::encode(tx_hash_bytes));
             }
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // Mock provider to return PENDING status (not SUCCESS or FAILED)
             mocks
@@ -2271,7 +2400,7 @@ mod tests {
                 stellar_data.hash = Some(hex::encode(tx_hash_bytes));
             }
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             mocks
                 .provider
@@ -2314,7 +2443,7 @@ mod tests {
                 stellar_data.hash = Some(hex::encode(tx_hash_bytes));
             }
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             mocks
                 .provider
@@ -2359,7 +2488,7 @@ mod tests {
                 stellar_data.hash = Some(hex::encode(tx_hash_bytes));
             }
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             mocks
                 .provider
@@ -2400,7 +2529,7 @@ mod tests {
                 stellar_data.hash = Some(hex::encode(tx_hash_bytes));
             }
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // Mock provider to return PENDING status (not SUCCESS or FAILED)
             mocks
@@ -2443,7 +2572,7 @@ mod tests {
                 stellar_data.hash = Some(hex::encode(tx_hash_bytes));
             }
 
-            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+            let expected_stellar_hash = stellar_xdr::Hash(tx_hash_bytes);
 
             // Mock provider to return PENDING status
             mocks
@@ -2914,7 +3043,7 @@ mod tests {
 
     mod failure_detail_helper_tests {
         use super::*;
-        use soroban_rs::xdr::{InvokeHostFunctionResult, OperationResult, OperationResultTr, VecM};
+        use stellar_xdr::{InvokeHostFunctionResult, OperationResult, OperationResultTr, VecM};
 
         #[test]
         fn first_failing_op_finds_trapped() {
@@ -2930,7 +3059,7 @@ mod tests {
         fn first_failing_op_skips_success() {
             let ops: VecM<OperationResult> = vec![
                 OperationResult::OpInner(OperationResultTr::InvokeHostFunction(
-                    InvokeHostFunctionResult::Success(soroban_rs::xdr::Hash([0u8; 32])),
+                    InvokeHostFunctionResult::Success(stellar_xdr::Hash([0u8; 32])),
                 )),
                 OperationResult::OpInner(OperationResultTr::InvokeHostFunction(
                     InvokeHostFunctionResult::ResourceLimitExceeded,
@@ -2948,7 +3077,7 @@ mod tests {
         fn first_failing_op_all_success_returns_none() {
             let ops: VecM<OperationResult> = vec![OperationResult::OpInner(
                 OperationResultTr::InvokeHostFunction(InvokeHostFunctionResult::Success(
-                    soroban_rs::xdr::Hash([0u8; 32]),
+                    stellar_xdr::Hash([0u8; 32]),
                 )),
             )]
             .try_into()
@@ -2965,6 +3094,219 @@ mod tests {
         fn first_failing_op_op_bad_auth() {
             let ops: VecM<OperationResult> = vec![OperationResult::OpBadAuth].try_into().unwrap();
             assert_eq!(first_failing_op(ops.as_slice()), Some("OpBadAuth"));
+        }
+
+        #[test]
+        fn format_failure_reason_outer_only() {
+            let s = format_failure_reason("TxBadSeq", None, None, None);
+            assert_eq!(s, "Transaction failed on-chain. reason=TxBadSeq");
+            assert!(!s.contains("inner="));
+            assert!(!s.contains("op="));
+            assert!(!s.contains("contract_error="));
+        }
+
+        #[test]
+        fn format_failure_reason_layers_inner_and_op() {
+            let s = format_failure_reason(
+                "TxFeeBumpInnerFailed",
+                Some("TxFailed"),
+                Some("Trapped"),
+                None,
+            );
+            assert!(s.contains("reason=TxFeeBumpInnerFailed"));
+            assert!(s.contains("inner=TxFailed"));
+            assert!(s.contains("op=Trapped"));
+            assert!(!s.contains("contract_error="));
+        }
+
+        #[test]
+        fn format_failure_reason_classic_op_failure() {
+            let ops: VecM<OperationResult> = vec![OperationResult::OpBadAuth].try_into().unwrap();
+            let op = first_failing_op(ops.as_slice());
+            let s = format_failure_reason("TxFailed", None, op, None);
+            assert!(s.contains("reason=TxFailed"));
+            assert!(s.contains("op=OpBadAuth"));
+            assert!(!s.contains("contract_error="));
+        }
+
+        fn make_diag_event(topics: Vec<ScVal>, data: ScVal) -> DiagnosticEvent {
+            use stellar_xdr::{ContractEvent, ContractEventType, ContractEventV0, ExtensionPoint};
+            DiagnosticEvent {
+                in_successful_contract_call: false,
+                event: ContractEvent {
+                    ext: ExtensionPoint::V0,
+                    contract_id: None,
+                    type_: ContractEventType::Diagnostic,
+                    body: ContractEventBody::V0(ContractEventV0 {
+                        topics: topics.try_into().unwrap(),
+                        data,
+                    }),
+                },
+            }
+        }
+
+        #[test]
+        fn extract_contract_error_finds_sc_error() {
+            use stellar_xdr::ScError;
+            let evt = make_diag_event(vec![], ScVal::Error(ScError::Contract(5)));
+            assert_eq!(
+                extract_contract_error(&[evt]),
+                Some("Contract(5)".to_string())
+            );
+        }
+
+        #[test]
+        fn extract_contract_error_returns_none_for_no_error() {
+            assert_eq!(extract_contract_error(&[]), None);
+            let evt = make_diag_event(
+                vec![ScVal::Symbol("transfer".try_into().unwrap())],
+                ScVal::I32(42),
+            );
+            assert_eq!(extract_contract_error(&[evt]), None);
+        }
+
+        #[test]
+        fn extract_contract_error_finds_error_with_message() {
+            use stellar_xdr::ScError;
+            let evt = make_diag_event(
+                vec![
+                    ScVal::Symbol("error".try_into().unwrap()),
+                    ScVal::Error(ScError::Contract(5)),
+                ],
+                ScVal::String(stellar_xdr::ScString(
+                    "insufficient balance".try_into().unwrap(),
+                )),
+            );
+            assert_eq!(
+                extract_contract_error(&[evt]),
+                Some("Contract(5) message=\"insufficient balance\"".to_string())
+            );
+        }
+
+        #[test]
+        fn format_failure_reason_includes_contract_error_and_message() {
+            use stellar_xdr::ScError;
+            let evt = make_diag_event(
+                vec![
+                    ScVal::Symbol("error".try_into().unwrap()),
+                    ScVal::Error(ScError::Contract(5)),
+                ],
+                ScVal::String(stellar_xdr::ScString(
+                    "insufficient balance".try_into().unwrap(),
+                )),
+            );
+            let ce = extract_contract_error(&[evt]);
+            let s = format_failure_reason(
+                "TxFeeBumpInnerFailed",
+                Some("TxFailed"),
+                Some("Trapped"),
+                ce.as_deref(),
+            );
+            assert!(s.contains("reason=TxFeeBumpInnerFailed"));
+            assert!(s.contains("inner=TxFailed"));
+            assert!(s.contains("op=Trapped"));
+            assert!(s.contains("contract_error=Contract(5)"));
+            assert!(s.contains("message=\"insufficient balance\""));
+        }
+
+        #[test]
+        fn extract_contract_error_first_event_wins() {
+            use stellar_xdr::ScError;
+            let no_error_evt = make_diag_event(
+                vec![ScVal::Symbol("fn_call".try_into().unwrap())],
+                ScVal::I32(7),
+            );
+            let first_error_evt = make_diag_event(
+                vec![
+                    ScVal::Symbol("error".try_into().unwrap()),
+                    ScVal::Error(ScError::Contract(1)),
+                ],
+                ScVal::Void,
+            );
+            let second_error_evt = make_diag_event(
+                vec![
+                    ScVal::Symbol("error".try_into().unwrap()),
+                    ScVal::Error(ScError::Contract(99)),
+                ],
+                ScVal::Void,
+            );
+            assert_eq!(
+                extract_contract_error(&[no_error_evt, first_error_evt, second_error_evt]),
+                Some("Contract(1)".to_string())
+            );
+        }
+
+        #[test]
+        fn extract_contract_error_renders_non_contract_error_types() {
+            use stellar_xdr::{ScError, ScErrorCode};
+            let evt = make_diag_event(
+                vec![],
+                ScVal::Error(ScError::Budget(ScErrorCode::ExceededLimit)),
+            );
+            assert_eq!(
+                extract_contract_error(&[evt]),
+                Some("Budget(ExceededLimit)".to_string())
+            );
+
+            let evt = make_diag_event(
+                vec![],
+                ScVal::Error(ScError::WasmVm(ScErrorCode::InvalidAction)),
+            );
+            assert_eq!(
+                extract_contract_error(&[evt]),
+                Some("WasmVm(InvalidAction)".to_string())
+            );
+        }
+
+        #[test]
+        fn extract_contract_error_finds_error_nested_in_vec() {
+            use stellar_xdr::{ScError, ScVec};
+            let nested: VecM<ScVal> = vec![
+                ScVal::Symbol("inner".try_into().unwrap()),
+                ScVal::Error(ScError::Contract(42)),
+            ]
+            .try_into()
+            .unwrap();
+            let evt = make_diag_event(
+                vec![ScVal::Symbol("error".try_into().unwrap())],
+                ScVal::Vec(Some(ScVec(nested))),
+            );
+            assert_eq!(
+                extract_contract_error(&[evt]),
+                Some("Contract(42) message=\"inner\"".to_string())
+            );
+        }
+
+        #[test]
+        fn sanitize_message_escapes_quotes_and_strips_control_chars() {
+            assert_eq!(sanitize_message("hello"), "hello");
+            assert_eq!(sanitize_message(""), "");
+            assert_eq!(
+                sanitize_message(r#"it has "quotes""#),
+                r#"it has \"quotes\""#
+            );
+            assert_eq!(
+                sanitize_message("multi\nline\twith\rcontrols"),
+                "multilinewithcontrols"
+            );
+        }
+
+        #[test]
+        fn extract_contract_error_decodes_real_prod_xdr() {
+            // Captured 2026-05-06 from prod-mainnet (channels-fund, inner tx
+            // 0de7de8245c9b39ffab6282ea196e0be26b0875c0bf2431ff97affed9eccba9b),
+            // event[1] of the failure's diagnosticEventsXdr stream. Topics
+            // [Symbol("error"), Error(Contract)], data Vec[String, U32(8)].
+            const PROD_EVENT_B64: &str = "AAAAAAAAAAAAAAAB1/5EvQrxHWArEJHy9KH03yEtRE0DIeoyrbPMHLurCgQAAAACAAAAAAAAAAIAAAAPAAAABWVycm9yAAAAAAAAAgAAAAAAAAAIAAAAEAAAAAEAAAACAAAADgAAABtmYWlsaW5nIHdpdGggY29udHJhY3QgZXJyb3IAAAAAAwAAAAg=";
+            let evt = <DiagnosticEvent as stellar_xdr::ReadXdr>::from_xdr_base64(
+                PROD_EVENT_B64,
+                Limits::none(),
+            )
+            .expect("real prod event should parse");
+            assert_eq!(
+                extract_contract_error(&[evt]),
+                Some("Contract(8) message=\"failing with contract error\"".to_string())
+            );
         }
     }
 }

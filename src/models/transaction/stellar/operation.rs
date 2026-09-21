@@ -3,14 +3,15 @@
 use crate::models::transaction::stellar::asset::AssetSpec;
 use crate::models::transaction::stellar::host_function::{ContractSource, WasmSource};
 use crate::models::SignerError;
+use crate::utils::{deserialize_i64, serialize_i64};
 use serde::{Deserialize, Serialize};
-use soroban_rs::xdr::{
+use std::convert::TryFrom;
+use stellar_strkey::{ed25519::MuxedAccount, ed25519::PublicKey};
+use stellar_xdr::{
     HostFunction, InvokeHostFunctionOp, MuxedAccount as XdrMuxedAccount, MuxedAccountMed25519,
     Operation, OperationBody, PaymentOp, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
     SorobanAuthorizedInvocation, SorobanCredentials, Uint256, VecM,
 };
-use std::convert::TryFrom;
-use stellar_strkey::{ed25519::MuxedAccount, ed25519::PublicKey};
 use utoipa::ToSchema;
 
 /// Authorization specification for Soroban operations
@@ -35,6 +36,12 @@ pub enum AuthSpec {
 pub enum OperationSpec {
     Payment {
         destination: String,
+        /// Amount in stroops, encoded as a decimal string to preserve precision.
+        // String serde keeps large integers precise through storage
+        // serialization; `value_type = String` syncs the OpenAPI schema.
+        // See `serialize_i64`.
+        #[serde(serialize_with = "serialize_i64", deserialize_with = "deserialize_i64")]
+        #[schema(value_type = String, pattern = "^-?[0-9]+$")]
         amount: i64,
         asset: AssetSpec,
     },
@@ -97,7 +104,7 @@ fn create_source_account_auth_entry(
 fn decode_xdr_auth_entries(
     xdr_entries: Vec<String>,
 ) -> Result<Vec<SorobanAuthorizationEntry>, SignerError> {
-    use soroban_rs::xdr::{Limits, ReadXdr};
+    use stellar_xdr::{Limits, ReadXdr};
 
     xdr_entries
         .iter()
@@ -300,7 +307,7 @@ impl TryFrom<OperationSpec> for Operation {
 mod tests {
     use super::*;
     use crate::models::transaction::stellar::host_function::ContractSource;
-    use soroban_rs::xdr::{
+    use stellar_xdr::{
         AccountId, ContractExecutable, ContractId, ContractIdPreimage,
         ContractIdPreimageFromAddress, CreateContractArgs, CreateContractArgsV2, Hash,
         PublicKey as XdrPublicKey, ScAddress,
@@ -310,6 +317,41 @@ mod tests {
     const TEST_CONTRACT: &str = "CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA";
     const TEST_MUXED: &str =
         "MAAAAAAAAAAAAAB7BQ2L7E5NBWMXDUCMZSIPOBKRDSBYVLMXGSSKF6YNPIB7Y77ITLVL6";
+
+    // Payment.amount is an i64 stored in Redis and re-encoded by the
+    // partial_update Lua script, so it must be serialized as a cjson-safe
+    // string (large stroop amounts would otherwise be floatified).
+    #[test]
+    fn test_payment_amount_serializes_as_string() {
+        let op = OperationSpec::Payment {
+            destination: TEST_PK.to_string(),
+            amount: 643918676885760,
+            asset: AssetSpec::Native,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert!(
+            json.contains(r#""amount":"643918676885760""#),
+            "amount should serialize as a string, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_payment_amount_deserializes_from_corrupted_float() {
+        let op = OperationSpec::Payment {
+            destination: TEST_PK.to_string(),
+            amount: 643918676885760,
+            asset: AssetSpec::Native,
+        };
+        let mut value = serde_json::to_value(&op).unwrap();
+        value["amount"] = serde_json::json!(643918676885760.0);
+        let json = serde_json::to_string(&value).unwrap();
+
+        let parsed: OperationSpec = serde_json::from_str(&json).unwrap();
+        match parsed {
+            OperationSpec::Payment { amount, .. } => assert_eq!(amount, 643918676885760),
+            other => panic!("expected Payment, got {other:?}"),
+        }
+    }
 
     mod parse_destination_address_tests {
         use super::*;
@@ -335,7 +377,7 @@ mod tests {
 
     mod create_source_account_auth_entry_tests {
         use super::*;
-        use soroban_rs::xdr::Uint256;
+        use stellar_xdr::Uint256;
 
         #[test]
         fn test_creates_correct_structure() {
@@ -386,7 +428,7 @@ mod tests {
 
     mod generate_default_auth_entries_tests {
         use super::*;
-        use soroban_rs::xdr::Uint256;
+        use stellar_xdr::Uint256;
 
         #[test]
         fn test_create_contract() {
@@ -425,9 +467,9 @@ mod tests {
 
         #[test]
         fn test_invoke_contract() {
-            let host_function = HostFunction::InvokeContract(soroban_rs::xdr::InvokeContractArgs {
+            let host_function = HostFunction::InvokeContract(stellar_xdr::InvokeContractArgs {
                 contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
-                function_name: soroban_rs::xdr::ScSymbol::try_from(b"test".to_vec()).unwrap(),
+                function_name: stellar_xdr::ScSymbol::try_from(b"test".to_vec()).unwrap(),
                 args: VecM::default(),
             });
 
@@ -448,7 +490,7 @@ mod tests {
 
     mod build_auth_vector_tests {
         use super::*;
-        use soroban_rs::xdr::Uint256;
+        use stellar_xdr::Uint256;
 
         #[test]
         fn test_simple_auth() {
@@ -509,9 +551,9 @@ mod tests {
 
         #[test]
         fn test_none_default_invoke_contract() {
-            let host_function = HostFunction::InvokeContract(soroban_rs::xdr::InvokeContractArgs {
+            let host_function = HostFunction::InvokeContract(stellar_xdr::InvokeContractArgs {
                 contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
-                function_name: soroban_rs::xdr::ScSymbol::try_from(b"test".to_vec()).unwrap(),
+                function_name: stellar_xdr::ScSymbol::try_from(b"test".to_vec()).unwrap(),
                 args: VecM::default(),
             });
 
@@ -536,7 +578,7 @@ mod tests {
             } = result.unwrap()
             {
                 assert_eq!(op.amount, 1000);
-                assert!(matches!(op.asset, soroban_rs::xdr::Asset::Native));
+                assert!(matches!(op.asset, stellar_xdr::Asset::Native));
             } else {
                 panic!("Expected Payment operation");
             }

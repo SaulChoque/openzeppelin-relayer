@@ -14,7 +14,7 @@ use local_signer::*;
 use turnkey_signer::*;
 use vault_signer::*;
 
-use soroban_rs::xdr::SignatureHint;
+use stellar_xdr::SignatureHint;
 
 use crate::{
     domain::{SignDataRequest, SignDataResponse, SignTransactionResponse, SignTypedDataRequest},
@@ -147,12 +147,15 @@ impl StellarSignTrait for StellarSigner {
 pub struct StellarSignerFactory;
 
 impl StellarSignerFactory {
-    pub fn create_stellar_signer(
-        m: &SignerDomainModel,
+    pub async fn create_stellar_signer(
+        m: SignerDomainModel,
     ) -> Result<StellarSigner, SignerFactoryError> {
+        // Taken by value (like create_evm_signer): an `async fn` holding a
+        // `&SignerDomainModel` across `.await` is `!Send` because `Signer` is `!Sync`,
+        // and these futures are spawned on the multi-thread runtime.
         let signer = match &m.config {
             SignerConfig::Local(_) => {
-                let local_signer = LocalSigner::new(m)?;
+                let local_signer = LocalSigner::new(&m)?;
                 StellarSigner::Local(Box::new(local_signer))
             }
             SignerConfig::Vault(config) => {
@@ -186,15 +189,20 @@ impl StellarSignerFactory {
                 StellarSigner::Turnkey(TurnkeySigner::new(service))
             }
             SignerConfig::AwsKms(config) => {
-                let aws_kms_service = futures::executor::block_on(AwsKmsService::new(
-                    config.clone(),
-                ))
-                .map_err(|e| {
+                // Async construction (mirrors create_evm_signer): `block_on` here would
+                // park the carrier worker thread and not drive the reactor — under the
+                // multi-thread runtime a burst of cold-cache builds could park all workers.
+                let aws_kms_service = AwsKmsService::new(config.clone()).await.map_err(|e| {
                     SignerFactoryError::InvalidConfig(format!(
                         "Failed to create AWS KMS service: {e}"
                     ))
                 })?;
                 StellarSigner::AwsKms(AwsKmsSigner::new(aws_kms_service))
+            }
+            SignerConfig::AzureKeyVault(_) => {
+                return Err(SignerFactoryError::UnsupportedType(
+                    "Azure Key Vault".into(),
+                ))
             }
             SignerConfig::VaultTransit(_) => {
                 return Err(SignerFactoryError::UnsupportedType("Vault Transit".into()))
@@ -212,7 +220,7 @@ mod tests {
     #[test]
     fn test_derive_signature_hint_valid_stellar_address() {
         let pk = stellar_strkey::ed25519::PublicKey([0u8; 32]);
-        let address = Address::Stellar(pk.to_string());
+        let address = Address::Stellar(format!("{pk}"));
 
         let hint = derive_signature_hint(&address).unwrap();
         // Last 4 bytes of all-zero key
@@ -227,7 +235,7 @@ mod tests {
         key_bytes[30] = 0xCC;
         key_bytes[31] = 0xDD;
         let pk = stellar_strkey::ed25519::PublicKey(key_bytes);
-        let address = Address::Stellar(pk.to_string());
+        let address = Address::Stellar(format!("{pk}"));
 
         let hint = derive_signature_hint(&address).unwrap();
         assert_eq!(hint.0, [0xAA, 0xBB, 0xCC, 0xDD]);

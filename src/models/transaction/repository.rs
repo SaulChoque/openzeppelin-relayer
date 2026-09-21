@@ -23,7 +23,10 @@ use crate::{
         RelayerError, RelayerRepoModel, SignerError, StellarNetwork, StellarValidationError,
         TransactionError, U256,
     },
-    utils::{deserialize_optional_u128, serialize_optional_u128},
+    utils::{
+        deserialize_i64, deserialize_optional_i64, deserialize_optional_u128, serialize_i64,
+        serialize_optional_i64, serialize_optional_u128,
+    },
 };
 use alloy::{
     consensus::{TxEip1559, TxLegacy},
@@ -33,14 +36,14 @@ use alloy::{
 
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
-use soroban_rs::xdr::{TransactionEnvelope, TransactionV1Envelope, VecM};
 use std::{convert::TryFrom, str::FromStr};
+use stellar_xdr::{TransactionEnvelope, TransactionV1Envelope, VecM};
 use strum::Display;
 
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use soroban_rs::xdr::Transaction as SorobanTransaction;
+use stellar_xdr::Transaction as SorobanTransaction;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema, Display)]
 #[serde(rename_all = "lowercase")]
@@ -521,7 +524,13 @@ pub enum TransactionInput {
     /// Pre-built unsigned XDR that needs signing
     UnsignedXdr(String),
     /// Pre-built signed XDR that needs fee-bumping
-    SignedXdr { xdr: String, max_fee: i64 },
+    SignedXdr {
+        xdr: String,
+        // String-encoded like `sequence_number` to stay precise through storage
+        // serialization; see `serialize_i64`.
+        #[serde(serialize_with = "serialize_i64", deserialize_with = "deserialize_i64")]
+        max_fee: i64,
+    },
     /// Soroban gas abstraction: FeeForwarder transaction with user's signed auth entry
     /// The XDR is the FeeForwarder transaction from /build, and the signed_auth_entry
     /// contains the user's signed SorobanAuthorizationEntry to be injected.
@@ -626,6 +635,13 @@ impl TransactionInput {
 pub struct StellarTransactionData {
     pub source_account: String,
     pub fee: Option<u32>,
+    // String-encoded to keep large i64s precise through storage serialization;
+    // see `serialize_optional_i64`.
+    #[serde(
+        serialize_with = "serialize_optional_i64",
+        deserialize_with = "deserialize_optional_i64",
+        default
+    )]
     pub sequence_number: Option<i64>,
     pub memo: Option<MemoSpec>,
     pub valid_until: Option<String>,
@@ -806,7 +822,7 @@ impl StellarTransactionData {
 
     // Helper method to parse XDR envelope
     fn parse_xdr_envelope(&self, xdr: &str) -> Result<TransactionEnvelope, SignerError> {
-        use soroban_rs::xdr::{Limits, ReadXdr};
+        use stellar_xdr::{Limits, ReadXdr};
         TransactionEnvelope::from_xdr_base64(xdr, Limits::none())
             .map_err(|e| SignerError::ConversionError(format!("Invalid XDR: {e}")))
     }
@@ -816,7 +832,7 @@ impl StellarTransactionData {
         &self,
         envelope: TransactionEnvelope,
     ) -> Result<TransactionEnvelope, SignerError> {
-        use soroban_rs::xdr::{Limits, ReadXdr, WriteXdr};
+        use stellar_xdr::{Limits, ReadXdr, WriteXdr};
 
         // Serialize and re-parse to get a mutable version
         let envelope_xdr = envelope.to_xdr_base64(Limits::none()).map_err(|e| {
@@ -869,7 +885,7 @@ impl StellarTransactionData {
     /// Return a new instance with simulation data applied (fees and transaction extension).
     pub fn with_simulation_data(
         mut self,
-        sim_response: soroban_rs::stellar_rpc_client::SimulateTransactionResponse,
+        sim_response: stellar_rpc_client::SimulateTransactionResponse,
         operations_count: u64,
     ) -> Result<Self, SignerError> {
         use tracing::info;
@@ -1206,8 +1222,8 @@ impl From<&[u8; 65]> for EvmTransactionDataSignature {
 #[cfg(test)]
 mod tests {
     use lazy_static::lazy_static;
-    use soroban_rs::xdr::{BytesM, Signature, SignatureHint};
     use std::sync::Mutex;
+    use stellar_xdr::{BytesM, Signature, SignatureHint};
 
     use super::*;
     use crate::{
@@ -1751,6 +1767,106 @@ mod tests {
     }
 
     #[test]
+    fn test_stellar_sequence_number_serializes_as_string() {
+        // sequence_number must serialize as a JSON string so it survives a
+        // Redis/Lua cjson decode->encode round-trip. Lua 5.1 (bundled by
+        // Redis) has no integer type, so a large i64 stored as a bare JSON
+        // number is re-emitted as a float (e.g. 643918676885760.0), which
+        // then fails to deserialize back into i64. A quoted string is opaque
+        // to cjson and round-trips untouched.
+        let mut tx = test_stellar_tx_data();
+        tx.sequence_number = Some(643918676885760);
+
+        let json = serde_json::to_string(&tx).unwrap();
+
+        assert!(
+            json.contains(r#""sequence_number":"643918676885760""#),
+            "sequence_number should serialize as a string, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_stellar_sequence_number_deserializes_from_corrupted_float() {
+        // Regression for the GCP crash: transactions already stored in Redis
+        // hold sequence_number as a float (643918676885760.0) after a cjson
+        // round-trip. Deserialization must recover the integer value rather
+        // than erroring with "invalid type: floating point ..., expected i64".
+        let mut value = serde_json::to_value(test_stellar_tx_data()).unwrap();
+        value["sequence_number"] = serde_json::json!(643918676885760.0);
+        let json = serde_json::to_string(&value).unwrap();
+
+        let tx: StellarTransactionData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(tx.sequence_number, Some(643918676885760));
+    }
+
+    #[test]
+    fn test_stellar_sequence_number_deserializes_from_legacy_integer() {
+        // Backward compat: records written before this fix hold a bare integer.
+        // (Passes today; guards us against regressing the legacy on-disk form.)
+        let mut value = serde_json::to_value(test_stellar_tx_data()).unwrap();
+        value["sequence_number"] = serde_json::json!(643918676885760_i64);
+        let json = serde_json::to_string(&value).unwrap();
+
+        let tx: StellarTransactionData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(tx.sequence_number, Some(643918676885760));
+    }
+
+    fn signed_xdr_tx_data(max_fee: i64) -> StellarTransactionData {
+        let mut tx = test_stellar_tx_data();
+        tx.transaction_input = TransactionInput::SignedXdr {
+            xdr: "AAAA".to_string(),
+            max_fee,
+        };
+        tx
+    }
+
+    #[test]
+    fn test_stellar_signed_xdr_max_fee_serializes_as_string() {
+        // SignedXdr.max_fee is an i64 stored in Redis and re-encoded by the
+        // partial_update Lua script, so it has the same cjson float-corruption
+        // exposure as sequence_number and must serialize as a string too.
+        let json = serde_json::to_string(&signed_xdr_tx_data(643918676885760)).unwrap();
+
+        assert!(
+            json.contains(r#""max_fee":"643918676885760""#),
+            "max_fee should serialize as a string, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_stellar_signed_xdr_max_fee_deserializes_from_corrupted_float() {
+        // Regression: a SignedXdr tx whose max_fee was floatified by a cjson
+        // round-trip must still deserialize.
+        let mut value = serde_json::to_value(signed_xdr_tx_data(643918676885760)).unwrap();
+        value["transaction_input"]["SignedXdr"]["max_fee"] = serde_json::json!(643918676885760.0);
+        let json = serde_json::to_string(&value).unwrap();
+
+        let tx: StellarTransactionData = serde_json::from_str(&json).unwrap();
+
+        match tx.transaction_input {
+            TransactionInput::SignedXdr { max_fee, .. } => assert_eq!(max_fee, 643918676885760),
+            other => panic!("expected SignedXdr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stellar_signed_xdr_max_fee_deserializes_from_legacy_integer() {
+        // Backward compat with bare-integer records written before this fix.
+        let mut value = serde_json::to_value(signed_xdr_tx_data(35014)).unwrap();
+        value["transaction_input"]["SignedXdr"]["max_fee"] = serde_json::json!(35014_i64);
+        let json = serde_json::to_string(&value).unwrap();
+
+        let tx: StellarTransactionData = serde_json::from_str(&json).unwrap();
+
+        match tx.transaction_input {
+            TransactionInput::SignedXdr { max_fee, .. } => assert_eq!(max_fee, 35014),
+            other => panic!("expected SignedXdr, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_get_envelope_for_simulation() {
         let tx = test_stellar_tx_data();
         let env = tx.get_envelope_for_simulation();
@@ -1758,7 +1874,7 @@ mod tests {
         let env = env.unwrap();
         // Should be a TransactionV1Envelope with no signatures
         match env {
-            soroban_rs::xdr::TransactionEnvelope::Tx(tx_env) => {
+            stellar_xdr::TransactionEnvelope::Tx(tx_env) => {
                 assert_eq!(tx_env.signatures.len(), 0);
             }
             _ => {
@@ -1775,7 +1891,7 @@ mod tests {
         assert!(env.is_ok());
         let env = env.unwrap();
         match env {
-            soroban_rs::xdr::TransactionEnvelope::Tx(tx_env) => {
+            stellar_xdr::TransactionEnvelope::Tx(tx_env) => {
                 assert_eq!(tx_env.signatures.len(), 1);
             }
             _ => {
@@ -2366,7 +2482,7 @@ mod tests {
     fn test_stellar_transaction_data_serialization_roundtrip() {
         use crate::models::transaction::stellar::asset::AssetSpec;
         use crate::models::transaction::stellar::operation::OperationSpec;
-        use soroban_rs::xdr::{BytesM, Signature, SignatureHint};
+        use stellar_xdr::{BytesM, Signature, SignatureHint};
 
         // Create a dummy signature
         let hint = SignatureHint([1, 2, 3, 4]);
@@ -2517,8 +2633,8 @@ mod tests {
         // Test case 3: Signed XDR with fee_bump
         // Create a signed XDR by duplicating the test logic from xdr_tests
         let signed_xdr = {
-            use soroban_rs::xdr::{Limits, TransactionEnvelope, TransactionV1Envelope, WriteXdr};
             use stellar_strkey::ed25519::PublicKey;
+            use stellar_xdr::{Limits, TransactionEnvelope, TransactionV1Envelope, WriteXdr};
 
             // Use the same transaction structure but add a dummy signature
             let source_pk =
@@ -2528,41 +2644,39 @@ mod tests {
                 PublicKey::from_string("GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGSNFHEYVXM3XOJMDS674JZ")
                     .unwrap();
 
-            let payment_op = soroban_rs::xdr::PaymentOp {
-                destination: soroban_rs::xdr::MuxedAccount::Ed25519(soroban_rs::xdr::Uint256(
-                    dest_pk.0,
-                )),
-                asset: soroban_rs::xdr::Asset::Native,
+            let payment_op = stellar_xdr::PaymentOp {
+                destination: stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(dest_pk.0)),
+                asset: stellar_xdr::Asset::Native,
                 amount: 1000000,
             };
 
-            let operation = soroban_rs::xdr::Operation {
+            let operation = stellar_xdr::Operation {
                 source_account: None,
-                body: soroban_rs::xdr::OperationBody::Payment(payment_op),
+                body: stellar_xdr::OperationBody::Payment(payment_op),
             };
 
-            let operations: soroban_rs::xdr::VecM<soroban_rs::xdr::Operation, 100> =
+            let operations: stellar_xdr::VecM<stellar_xdr::Operation, 100> =
                 vec![operation].try_into().unwrap();
 
-            let tx = soroban_rs::xdr::Transaction {
-                source_account: soroban_rs::xdr::MuxedAccount::Ed25519(soroban_rs::xdr::Uint256(
+            let tx = stellar_xdr::Transaction {
+                source_account: stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
                     source_pk.0,
                 )),
                 fee: 100,
-                seq_num: soroban_rs::xdr::SequenceNumber(1),
-                cond: soroban_rs::xdr::Preconditions::None,
-                memo: soroban_rs::xdr::Memo::None,
+                seq_num: stellar_xdr::SequenceNumber(1),
+                cond: stellar_xdr::Preconditions::None,
+                memo: stellar_xdr::Memo::None,
                 operations,
-                ext: soroban_rs::xdr::TransactionExt::V0,
+                ext: stellar_xdr::TransactionExt::V0,
             };
 
             // Add a dummy signature
-            let hint = soroban_rs::xdr::SignatureHint([0; 4]);
+            let hint = stellar_xdr::SignatureHint([0; 4]);
             let sig_bytes: Vec<u8> = vec![0u8; 64];
-            let sig_bytes_m: soroban_rs::xdr::BytesM<64> = sig_bytes.try_into().unwrap();
-            let sig = soroban_rs::xdr::DecoratedSignature {
+            let sig_bytes_m: stellar_xdr::BytesM<64> = sig_bytes.try_into().unwrap();
+            let sig = stellar_xdr::DecoratedSignature {
                 hint,
-                signature: soroban_rs::xdr::Signature(sig_bytes_m),
+                signature: stellar_xdr::Signature(sig_bytes_m),
             };
 
             let envelope = TransactionV1Envelope {

@@ -1,7 +1,7 @@
 # Base image
-# Rustc v1.91.1
-# The digest needs to be updated everytime the minimum version is changed, and if the version is above 1.91.1
-FROM cgr.dev/chainguard/rust:latest-dev@sha256:33faad9a26e8437ed9725bea3eb2d1e85facd1c035a31af8d485ea8c0a935532 AS base
+# Rustc v1.93.0 minimum (MSRV, see rust-version in Cargo.toml)
+# The digest needs to be updated everytime the minimum version is changed, and if the version is above 1.93.0
+FROM cgr.dev/chainguard/rust:latest-dev@sha256:63fe36977879f68bb449c681f1e1e3a60d7368ec2b7a67f21fae3737fe7cc3a4 AS base
 
 USER root
 RUN apk update && apk --no-cache add \
@@ -47,8 +47,9 @@ RUN apk add --no-cache nodejs=~${NODE_VERSION} npm
 
 ENV PATH="/usr/local/bin:$PATH"
 
-# Install pnpm and ts-node
-RUN npm install -g pnpm ts-node typescript
+# Pin the pnpm major: pnpm 12 ships a preinstall script that newer npm blocks by
+# default, which leaves a broken pnpm shim. pnpm 10 matches the lockfile format.
+RUN npm install -g pnpm@10
 
 # removes apk and unneeded wolfi-base tools.
 RUN apk del wolfi-base apk-tools
@@ -58,10 +59,16 @@ COPY --chown=nonroot:nonroot ./plugins /app/plugins
 
 USER nonroot
 WORKDIR /app/plugins
-RUN pnpm install --frozen-lockfile
+# Full install so postinstall can compile pool-executor.js with the
+# lockfile's ts-node/typescript. prune --prod then drops the dev
+# tree; --ignore-scripts is required because prune re-runs
+# postinstall after ts-node is already gone.
+RUN pnpm install --frozen-lockfile \
+ && pnpm prune --prod --ignore-scripts
 
 # Return to app root
 WORKDIR /app
+ENV PATH="/app/plugins/node_modules/.bin:/usr/local/bin:$PATH"
 
 ENV APP_PORT=8080
 ENV METRICS_PORT=8081
