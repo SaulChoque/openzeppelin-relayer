@@ -257,7 +257,7 @@ pub enum SolanaRpcRequest {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema, PartialEq)]
+#[derive(Debug, Deserialize, ToSchema, PartialEq)]
 #[serde(tag = "method", rename_all = "camelCase")]
 pub enum SolanaRpcResult {
     FeeEstimate(FeeEstimateResult),
@@ -270,9 +270,87 @@ pub enum SolanaRpcResult {
     RawRpc(serde_json::Value),
 }
 
+/// Borrowed mirror of [`SolanaRpcResult`] used to keep the internally tagged
+/// (`"method"`) serialization for typed results and object raw results.
+#[derive(Serialize)]
+#[serde(tag = "method", rename_all = "camelCase")]
+enum SolanaRpcResultRef<'a> {
+    FeeEstimate(&'a FeeEstimateResult),
+    TransferTransaction(&'a TransferTransactionResult),
+    PrepareTransaction(&'a PrepareTransactionResult),
+    SignTransaction(&'a SignTransactionResult),
+    SignAndSendTransaction(&'a SignAndSendTransactionResult),
+    GetSupportedTokens(&'a GetSupportedTokensResult),
+    GetFeaturesEnabled(&'a GetFeaturesEnabledResult),
+    RawRpc(&'a serde_json::Value),
+}
+
+impl Serialize for SolanaRpcResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let tagged = match self {
+            // An internally tagged newtype can only wrap a map. Raw JSON-RPC
+            // results such as `sendTransaction` (a signature string),
+            // `getBlockHeight` (a number) or `getGenesisHash` (a string) are
+            // returned as-is instead of failing to serialize.
+            Self::RawRpc(value) if !value.is_object() => return value.serialize(serializer),
+            Self::RawRpc(value) => SolanaRpcResultRef::RawRpc(value),
+            Self::FeeEstimate(r) => SolanaRpcResultRef::FeeEstimate(r),
+            Self::TransferTransaction(r) => SolanaRpcResultRef::TransferTransaction(r),
+            Self::PrepareTransaction(r) => SolanaRpcResultRef::PrepareTransaction(r),
+            Self::SignTransaction(r) => SolanaRpcResultRef::SignTransaction(r),
+            Self::SignAndSendTransaction(r) => SolanaRpcResultRef::SignAndSendTransaction(r),
+            Self::GetSupportedTokens(r) => SolanaRpcResultRef::GetSupportedTokens(r),
+            Self::GetFeaturesEnabled(r) => SolanaRpcResultRef::GetFeaturesEnabled(r),
+        };
+        tagged.serialize(serializer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_raw_rpc_result_serializes_non_object_values_as_is() {
+        let signature = SolanaRpcResult::RawRpc(serde_json::json!("5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW"));
+        assert_eq!(
+            serde_json::to_value(&signature).unwrap(),
+            serde_json::json!("5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW")
+        );
+
+        let height = SolanaRpcResult::RawRpc(serde_json::json!(12345));
+        assert_eq!(
+            serde_json::to_value(&height).unwrap(),
+            serde_json::json!(12345)
+        );
+
+        let list = SolanaRpcResult::RawRpc(serde_json::json!([1, 2]));
+        assert_eq!(
+            serde_json::to_value(&list).unwrap(),
+            serde_json::json!([1, 2])
+        );
+    }
+
+    #[test]
+    fn test_raw_rpc_result_object_keeps_method_tag() {
+        let result = SolanaRpcResult::RawRpc(serde_json::json!({"value": {"err": null}}));
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::json!({"method": "rawRpc", "value": {"err": null}})
+        );
+    }
+
+    #[test]
+    fn test_typed_result_keeps_method_tag() {
+        let result = SolanaRpcResult::SignTransaction(SignTransactionResult {
+            transaction: EncodedSerializedTransaction::new("dHg=".to_string()),
+            signature: "sig".to_string(),
+        });
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::json!({"method": "signTransaction", "transaction": "dHg=", "signature": "sig"})
+        );
+    }
     use solana_sdk::{
         hash::Hash,
         message::Message,

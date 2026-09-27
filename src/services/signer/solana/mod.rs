@@ -37,9 +37,10 @@ mod aws_kms_signer;
 use aws_kms_signer::*;
 
 use solana_program::message::compiled_instruction::CompiledInstruction;
+use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use solana_sdk::transaction::Transaction as SolanaTransaction;
+use solana_sdk::transaction::VersionedTransaction;
 use std::str::FromStr;
 
 use solana_system_interface::instruction as system_instruction;
@@ -97,19 +98,40 @@ impl Signer for SolanaSigner {
             )
         })?;
 
-        // Decode transaction from base64
+        // Decode transaction from base64. Decoding as a versioned transaction first
+        // lets us tell legacy and v0 messages apart: decoding v0 bytes as a legacy
+        // transaction does not fail reliably, it misreads the message instead.
         let encoded_tx = EncodedSerializedTransaction::new(transaction_str);
-        let sdk_transaction = SolanaTransaction::try_from(encoded_tx)
+        let versioned_tx = VersionedTransaction::try_from(encoded_tx)
             .map_err(|e| SignerError::SigningError(format!("Failed to decode transaction: {e}")))?;
 
-        // Sign using the SDK transaction signing helper function
-        let (signed_tx, signature) = sign_sdk_transaction(self, sdk_transaction).await?;
+        let (encoded_signed_tx, signature) = match versioned_tx.message {
+            VersionedMessage::Legacy(_) => {
+                let sdk_transaction = versioned_tx.into_legacy_transaction().ok_or_else(|| {
+                    SignerError::SigningError(
+                        "Failed to convert legacy message into a transaction".to_string(),
+                    )
+                })?;
 
-        // Encode back to base64
-        let encoded_signed_tx =
-            EncodedSerializedTransaction::try_from(&signed_tx).map_err(|e| {
-                SignerError::SigningError(format!("Failed to encode signed transaction: {e}"))
-            })?;
+                // Sign using the SDK transaction signing helper function
+                let (signed_tx, signature) = sign_sdk_transaction(self, sdk_transaction).await?;
+
+                // Encode back to base64
+                let encoded = EncodedSerializedTransaction::try_from(&signed_tx).map_err(|e| {
+                    SignerError::SigningError(format!("Failed to encode signed transaction: {e}"))
+                })?;
+                (encoded, signature)
+            }
+            VersionedMessage::V0(_) => {
+                let (signed_tx, signature) =
+                    sign_sdk_versioned_transaction(self, versioned_tx).await?;
+
+                let encoded = EncodedSerializedTransaction::try_from(&signed_tx).map_err(|e| {
+                    SignerError::SigningError(format!("Failed to encode signed transaction: {e}"))
+                })?;
+                (encoded, signature)
+            }
+        };
 
         // Return Solana-specific response
         Ok(SignTransactionResponse::Solana(
@@ -205,6 +227,49 @@ pub async fn sign_sdk_transaction<T: SolanaSignTrait + ?Sized>(
         .resize(num_required, Signature::default());
 
     // Set our signature at the correct index
+    transaction.signatures[signer_index] = signature;
+
+    Ok((transaction, signature))
+}
+
+/// Signs a versioned (v0) Solana transaction as one of its required signers.
+///
+/// Works like [`sign_sdk_transaction`] but for `VersionedTransaction`: the signer
+/// must be one of the message's static account keys within the required
+/// signature range. Existing signatures (e.g. a client's partial signature) are
+/// preserved; only the signer's own slot is written.
+pub async fn sign_sdk_versioned_transaction<T: SolanaSignTrait + ?Sized>(
+    signer: &T,
+    mut transaction: VersionedTransaction,
+) -> Result<(VersionedTransaction, Signature), SignerError> {
+    let signer_address = signer.pubkey().await?;
+    let signer_pubkey = Pubkey::from_str(&signer_address.to_string())
+        .map_err(|e| SignerError::KeyError(format!("Invalid signer address: {e}")))?;
+
+    // Signers are always static account keys (lookup tables cannot hold signers)
+    let signer_index = transaction
+        .message
+        .static_account_keys()
+        .iter()
+        .position(|key| *key == signer_pubkey)
+        .ok_or_else(|| {
+            SignerError::SigningError(
+                "Signer public key not found in transaction signers".to_string(),
+            )
+        })?;
+
+    let num_required = transaction.message.header().num_required_signatures as usize;
+    if signer_index >= num_required {
+        return Err(SignerError::SigningError(format!(
+            "Signer is not marked as a required signer in the transaction (position {signer_index} >= {num_required})"
+        )));
+    }
+
+    let signature = signer.sign(&transaction.message.serialize()).await?;
+
+    transaction
+        .signatures
+        .resize(num_required, Signature::default());
     transaction.signatures[signer_index] = signature;
 
     Ok((transaction, signature))
@@ -862,6 +927,178 @@ mod solana_signer_factory_tests {
                 assert!(!solana_response.signature.is_empty());
             }
             _ => panic!("Expected Solana response"),
+        }
+    }
+
+    /// Builds a transaction where the relayer (test key) is the fee payer and a
+    /// separate client keypair must also sign (it moves its own lamports).
+    fn relayer_paid_instruction_parts() -> (
+        solana_sdk::pubkey::Pubkey,
+        solana_sdk::signature::Keypair,
+        solana_sdk::instruction::Instruction,
+    ) {
+        let relayer_pubkey = Pubkey::from_str(&test_key_bytes_pubkey().to_string()).unwrap();
+        let client = solana_sdk::signature::Keypair::new();
+        let client_pubkey = solana_sdk::signer::Signer::pubkey(&client);
+        let instruction = solana_system_interface::instruction::transfer(
+            &client_pubkey,
+            &Pubkey::new_unique(),
+            1000,
+        );
+        (relayer_pubkey, client, instruction)
+    }
+
+    async fn test_solana_signer() -> SolanaSigner {
+        let signer_model = SignerDomainModel {
+            id: "test".to_string(),
+            config: SignerConfig::Local(LocalSignerConfig {
+                raw_key: test_key_bytes(),
+            }),
+        };
+        SolanaSignerFactory::create_solana_signer(signer_model)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_sign_transaction_v0_preserves_client_signature() {
+        use crate::models::{NetworkTransactionData, SolanaTransactionData};
+        use solana_sdk::hash::Hash;
+        use solana_sdk::message::{v0, VersionedMessage};
+
+        let signer = test_solana_signer().await;
+        let (relayer_pubkey, client, instruction) = relayer_paid_instruction_parts();
+
+        let message = VersionedMessage::V0(
+            v0::Message::try_compile(&relayer_pubkey, &[instruction], &[], Hash::new_unique())
+                .unwrap(),
+        );
+        let message_bytes = message.serialize();
+        let client_signature = solana_sdk::signer::Signer::sign_message(&client, &message_bytes);
+        let partially_signed = VersionedTransaction {
+            signatures: vec![Signature::default(), client_signature],
+            message,
+        };
+        let encoded = EncodedSerializedTransaction::try_from(&partially_signed).unwrap();
+
+        let response = signer
+            .sign_transaction(NetworkTransactionData::Solana(SolanaTransactionData {
+                transaction: Some(encoded.into_inner()),
+                ..Default::default()
+            }))
+            .await
+            .expect("v0 transactions should be signed");
+
+        let solana_response = match response {
+            crate::domain::SignTransactionResponse::Solana(r) => r,
+            _ => panic!("Expected Solana response"),
+        };
+        let signed = VersionedTransaction::try_from(solana_response.transaction).unwrap();
+
+        assert!(matches!(signed.message, VersionedMessage::V0(_)));
+        assert_eq!(
+            signed.message.serialize(),
+            message_bytes,
+            "message must not change"
+        );
+        assert_eq!(signed.signatures.len(), 2);
+        assert_eq!(signed.signatures[0].to_string(), solana_response.signature);
+        assert!(signed.signatures[0].verify(relayer_pubkey.as_ref(), &message_bytes));
+        assert_eq!(
+            signed.signatures[1], client_signature,
+            "client signature must be kept"
+        );
+        assert!(signed.verify_with_results().iter().all(|ok| *ok));
+    }
+
+    #[tokio::test]
+    async fn test_sign_transaction_legacy_preserves_client_signature() {
+        use crate::models::{NetworkTransactionData, SolanaTransactionData};
+        use solana_sdk::hash::Hash;
+        use solana_sdk::message::Message;
+
+        let signer = test_solana_signer().await;
+        let (relayer_pubkey, client, instruction) = relayer_paid_instruction_parts();
+
+        let message =
+            Message::new_with_blockhash(&[instruction], Some(&relayer_pubkey), &Hash::new_unique());
+        let mut transaction = solana_sdk::transaction::Transaction::new_unsigned(message);
+        transaction.partial_sign(&[&client], transaction.message.recent_blockhash);
+        let client_signature = transaction.signatures[1];
+        let encoded = EncodedSerializedTransaction::try_from(&transaction).unwrap();
+
+        let response = signer
+            .sign_transaction(NetworkTransactionData::Solana(SolanaTransactionData {
+                transaction: Some(encoded.into_inner()),
+                ..Default::default()
+            }))
+            .await
+            .expect("legacy transactions should still be signed");
+
+        let solana_response = match response {
+            crate::domain::SignTransactionResponse::Solana(r) => r,
+            _ => panic!("Expected Solana response"),
+        };
+        let signed =
+            solana_sdk::transaction::Transaction::try_from(solana_response.transaction).unwrap();
+
+        assert_eq!(signed.message, transaction.message);
+        assert_eq!(signed.signatures[1], client_signature);
+        assert!(signed.verify().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sign_sdk_versioned_transaction_signer_not_in_accounts() {
+        use solana_sdk::hash::Hash;
+        use solana_sdk::message::{v0, VersionedMessage};
+
+        let signer = test_solana_signer().await;
+        let other_payer = Pubkey::new_unique();
+        let instruction =
+            solana_system_interface::instruction::transfer(&other_payer, &Pubkey::new_unique(), 1);
+        let message = VersionedMessage::V0(
+            v0::Message::try_compile(&other_payer, &[instruction], &[], Hash::new_unique())
+                .unwrap(),
+        );
+        let transaction = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message,
+        };
+
+        let result = sign_sdk_versioned_transaction(&signer, transaction).await;
+        match result {
+            Err(SignerError::SigningError(msg)) => {
+                assert!(msg.contains("not found in transaction signers"))
+            }
+            other => panic!("Expected SigningError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sign_sdk_versioned_transaction_signer_not_required() {
+        use solana_sdk::hash::Hash;
+        use solana_sdk::message::{v0, VersionedMessage};
+
+        let signer = test_solana_signer().await;
+        let relayer_pubkey = Pubkey::from_str(&test_key_bytes_pubkey().to_string()).unwrap();
+        let payer = Pubkey::new_unique();
+        // The relayer only receives lamports: present in the message, not a signer
+        let instruction =
+            solana_system_interface::instruction::transfer(&payer, &relayer_pubkey, 1);
+        let message = VersionedMessage::V0(
+            v0::Message::try_compile(&payer, &[instruction], &[], Hash::new_unique()).unwrap(),
+        );
+        let transaction = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message,
+        };
+
+        let result = sign_sdk_versioned_transaction(&signer, transaction).await;
+        match result {
+            Err(SignerError::SigningError(msg)) => {
+                assert!(msg.contains("not marked as a required signer"))
+            }
+            other => panic!("Expected SigningError, got {other:?}"),
         }
     }
 
