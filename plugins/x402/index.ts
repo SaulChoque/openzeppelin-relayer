@@ -1,1 +1,1 @@
-export { handler } from "@openzeppelin/relayer-plugin-x402-facilitator";
+export { handler } from "@rodacio/relayer-plugin-x402-facilitator";
