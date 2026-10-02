@@ -1,6 +1,25 @@
 {
   "networks": [
     {
+      "average_blocktime_ms": 500,
+      "chain_id": 5042,
+      "explorer_urls": [
+        "https://arcscan.app"
+      ],
+      "features": [
+        "eip1559"
+      ],
+      "is_testnet": false,
+      "network": "arc-mainnet",
+      "required_confirmations": 1,
+      "rpc_urls": [
+        "https://rpc.mainnet.arc.io"
+      ],
+      "symbol": "USDC",
+      "tags": [],
+      "type": "evm"
+    },
+    {
       "average_blocktime_ms": 260,
       "chain_id": 5042002,
       "explorer_urls": [

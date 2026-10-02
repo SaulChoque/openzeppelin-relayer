@@ -13,7 +13,6 @@
       "required_confirmations": 1,
       "rpc_urls": [
         "https://avalanche-c-chain-rpc.publicnode.com",
-        "https://avalanche-mainnet.infura.io",
         "https://api.avax.network/ext/bc/C/rpc"
       ],
       "symbol": "AVAX",
@@ -30,7 +29,7 @@
       ],
       "is_testnet": true,
       "rpc_urls": [
-        "https://api.avax.network/ext/bc/C/rpc",
+        "https://api.avax-test.network/ext/bc/C/rpc",
         "https://avalanche-fuji-c-chain-rpc.publicnode.com"
       ]
     }
