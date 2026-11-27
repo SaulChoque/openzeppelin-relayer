@@ -67,3 +67,17 @@ test('does not reuse a settlement for different payment requirements', async () 
   });
   await expect(guardedSettlement(store, tx.first, 'request-b', async () => ({}))).rejects.toThrow('requirements');
 });
+
+test('reconciles an uncertain signature without resending', async () => {
+  const tx = fixture(), store = storage(), send = jest.fn(async (): Promise<{ id: string; signature: string }> => { throw new Error('lost ACK'); });
+  const op = async (journal: { submit: (signed: string, send: () => Promise<{ id: string; signature: string }>) => Promise<string> }) => {
+    await journal.submit(tx.signed, send); return {};
+  };
+  await guardedSettlement(store, tx.first, 'req', op);
+  const recovered = await guardedSettlement(store, tx.first, 'req', op, async record => {
+    expect(record.signature).toBe(tx.signature);
+    return { success: true, transaction: tx.signature };
+  });
+  expect(recovered.state).toBe('FINALIZED');
+  expect(send).toHaveBeenCalledTimes(1);
+});

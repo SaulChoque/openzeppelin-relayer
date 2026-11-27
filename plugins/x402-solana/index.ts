@@ -83,11 +83,33 @@ export async function handler({ api, kv, params, route, config }: PluginContext)
       maxRequiredSignatures: 2,
     });
     return settlement.settle(payload, requirements);
+  }, async record => {
+    // The reference facilitator's pending path checks confirmation and the actual
+    // on-chain CPI transfer. Signing and broadcast are deliberately disabled.
+    const pending = {
+      get: async () => record.signature,
+      set: async () => {},
+      delete: async () => {},
+    };
+    const verificationOnly = {
+      ...rpc,
+      signTransaction: async () => { throw new Error('Reconciliation cannot sign'); },
+      sendTransaction: async () => { throw new Error('Reconciliation cannot broadcast'); },
+    };
+    const recovery = new ExactSvmScheme(verificationOnly, undefined, {
+      enableSmartWalletVerification: true,
+      transactionVersions: [0],
+      maxComputeUnits: 400_000,
+      maxPriorityFeeMicroLamports: 50_000,
+      maxRequiredSignatures: 2,
+      pendingSettlementStore: pending,
+    });
+    return recovery.settle(payload, requirements);
   });
   if (guarded.state === 'FINALIZED' && guarded.result) return guarded.result;
   return {
     success: false,
-    errorReason: guarded.state === 'FAILED' ? 'verification_failed' : 'settlement_pending',
+    errorReason: guarded.state === 'FAILED' ? 'transaction_failed' : 'settlement_pending',
     network: DEVNET,
     transaction: guarded.signature ?? '',
     payer: '',

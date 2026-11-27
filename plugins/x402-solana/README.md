@@ -13,8 +13,10 @@ distributed lock. It records the public transaction signature before submission
 and refuses automatic re-submission after an ambiguous acknowledgement. The
 reference x402 verifier performs post-confirmation CPI verification. An explicit
 plugin flag is required, and it remains disabled in the local configuration.
-Reconciliation of uncertain records and an end-to-end Squads payment are still
-required before advertising settlement. Redis durability must be configured.
+Uncertain records are reconciled using the existing signature and the reference
+facilitator's on-chain confirmation and inner-instruction verification, without
+re-signing or re-sending. An end-to-end Squads payment and Redis durability
+configuration are still required before advertising settlement.
 
 Build an isolated test bundle using esbuild with the dependency lockfile:
 

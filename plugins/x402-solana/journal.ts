@@ -33,13 +33,27 @@ export async function guardedSettlement<T>(
   operation: (journal: {
     submit(signedTransaction: string, send: () => Promise<{ id: string; signature: string }>): Promise<string>;
   }) => Promise<T>,
+  reconcile?: (record: SettlementRecord) => Promise<T>,
 ): Promise<{ state: State; signature?: string; result?: T }> {
   const key = settlementKey(unsignedTransaction);
   const result = await store.withLock(key, async () => {
     const existing = await store.get<SettlementRecord>(key);
     if (existing) {
       if (existing.requestHash !== requestHash) throw new Error('Payment requirements do not match the recorded submission');
-      return { state: existing.state, signature: existing.signature, result: existing.result as T | undefined };
+      if (existing.state === 'FINALIZED' || existing.state === 'FAILED' || !reconcile) {
+        return { state: existing.state, signature: existing.signature, result: existing.result as T | undefined };
+      }
+      try {
+        const reconciled = await reconcile(existing);
+        const outcome = reconciled as { success?: boolean; transaction?: string; errorReason?: string };
+        const state: State = outcome.success && outcome.transaction === existing.signature ? 'FINALIZED'
+          : outcome.errorReason === 'transaction_failed' && outcome.transaction === existing.signature ? 'FAILED' : 'UNCERTAIN';
+        const updated: SettlementRecord = { ...existing, state, result: reconciled };
+        if (!await store.set(key, updated)) return { state: 'UNCERTAIN' as const, signature: existing.signature };
+        return { state, signature: existing.signature, result: reconciled };
+      } catch {
+        return { state: 'UNCERTAIN' as const, signature: existing.signature };
+      }
     }
 
     let claimed = false;
