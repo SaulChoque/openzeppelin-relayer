@@ -7,6 +7,7 @@ export interface SettlementRecord {
   state: State;
   signature: string;
   requestHash: string;
+  payer?: string;
   submissionId?: string;
   result?: unknown;
 }
@@ -31,7 +32,7 @@ export async function guardedSettlement<T>(
   unsignedTransaction: string,
   requestHash: string,
   operation: (journal: {
-    submit(signedTransaction: string, send: () => Promise<{ id: string; signature: string }>): Promise<string>;
+    submit(signedTransaction: string, payer: string, send: () => Promise<{ id: string; signature: string }>): Promise<string>;
   }) => Promise<T>,
   reconcile?: (record: SettlementRecord) => Promise<T>,
 ): Promise<{ state: State; signature?: string; result?: T }> {
@@ -58,22 +59,25 @@ export async function guardedSettlement<T>(
 
     let claimed = false;
     let signature: string | undefined;
+    let verifiedPayer = '';
     try {
       const settled = await operation({
-        async submit(signedTransaction, send) {
+        async submit(signedTransaction, payer, send) {
           if (claimed) throw new Error('Submission already claimed');
           const tx = VersionedTransaction.deserialize(Buffer.from(signedTransaction, 'base64'));
           if (settlementKey(signedTransaction) !== key || tx.signatures.some(s => s.every(b => b === 0))) {
             throw new Error('Signed transaction does not match verified payment');
           }
+          if (!payer) throw new Error('Verified payer required');
+          verifiedPayer = payer;
           signature = bs58.encode(tx.signatures[0]);
-          if (!await store.set(key, { state: 'SUBMITTING', signature, requestHash } satisfies SettlementRecord)) {
+          if (!await store.set(key, { state: 'SUBMITTING', signature, requestHash, payer } satisfies SettlementRecord)) {
             throw new Error('Unable to persist submission');
           }
           claimed = true;
           const receipt = await send();
           if (!receipt.id || receipt.signature !== signature) throw new Error('Relayer receipt mismatch');
-          if (!await store.set(key, { state: 'SUBMITTED', signature, requestHash, submissionId: receipt.id } satisfies SettlementRecord)) {
+          if (!await store.set(key, { state: 'SUBMITTED', signature, requestHash, payer, submissionId: receipt.id } satisfies SettlementRecord)) {
             throw new Error('Unable to persist relayer receipt');
           }
           return signature;
@@ -82,14 +86,14 @@ export async function guardedSettlement<T>(
       if (!claimed || !signature) return { state: 'FAILED' as const, result: settled };
       const data = settled as { success?: boolean; transaction?: string };
       const state: State = data.success && data.transaction === signature ? 'FINALIZED' : 'UNCERTAIN';
-      if (!await store.set(key, { state, signature, requestHash, result: settled } satisfies SettlementRecord)) {
+      if (!await store.set(key, { state, signature, requestHash, payer: verifiedPayer, result: settled } satisfies SettlementRecord)) {
         return { state: 'UNCERTAIN' as const, signature };
       }
-      return { state, signature, requestHash, result: settled };
+      return { state, signature, requestHash, payer: verifiedPayer, result: settled };
     } catch (error) {
       if (!claimed || !signature) throw error;
       // SUBMITTING is already durable even if this update fails.
-      await store.set(key, { state: 'UNCERTAIN', signature, requestHash } satisfies SettlementRecord).catch(() => false);
+      await store.set(key, { state: 'UNCERTAIN', signature, requestHash, payer: verifiedPayer } satisfies SettlementRecord).catch(() => false);
       return { state: 'UNCERTAIN' as const, signature };
     }
   }, { ttlSec: 180, onBusy: 'skip' });

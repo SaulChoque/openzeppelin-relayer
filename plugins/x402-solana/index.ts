@@ -64,6 +64,10 @@ export async function handler({ api, kv, params, route, config }: PluginContext)
   const sponsor = createSolanaSponsor(relayer as unknown as SolanaRelayer, feePayer);
   const requestHash = createHash('sha256').update(JSON.stringify([payload.accepted, requirements])).digest('hex');
   const guarded = await guardedSettlement(kv, payload.payload.transaction, requestHash, async journal => {
+    const verified = await scheme.verify(payload, requirements);
+    if (!verified.isValid || !verified.payer) {
+      return { success: false, errorReason: verified.invalidReason ?? 'verification_failed', network: DEVNET, transaction: '', payer: verified.payer ?? '' };
+    }
     const settlementSigner = {
       ...rpc,
       signTransaction: async (transaction: string, payer: string, network: string) => {
@@ -72,7 +76,7 @@ export async function handler({ api, kv, params, route, config }: PluginContext)
       },
       sendTransaction: async (transaction: string, network: string) => {
         if (network !== DEVNET) throw new Error('Unexpected network');
-        return journal.submit(transaction, () => sponsor.submit(transaction));
+        return journal.submit(transaction, verified.payer!, () => sponsor.submit(transaction));
       },
     };
     const settlement = new ExactSvmScheme(settlementSigner, undefined, {
@@ -104,7 +108,8 @@ export async function handler({ api, kv, params, route, config }: PluginContext)
       maxRequiredSignatures: 2,
       pendingSettlementStore: pending,
     });
-    return recovery.settle(payload, requirements);
+    const result = await recovery.settle(payload, requirements);
+    return result.success && !result.payer && record.payer ? { ...result, payer: record.payer } : result;
   });
   if (guarded.state === 'FINALIZED' && guarded.result) return guarded.result;
   return {

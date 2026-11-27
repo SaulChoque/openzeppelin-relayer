@@ -28,8 +28,8 @@ function storage(): JournalStore {
 }
 test('lost acknowledgement retains the signature and prevents a second submission', async () => {
   const tx = fixture(), store = storage(), send = jest.fn(async (): Promise<{ id: string; signature: string }> => { throw new Error('timeout'); });
-  const operation = async (journal: { submit: (signed: string, send: () => Promise<{ id: string; signature: string }>) => Promise<string> }) => {
-    await journal.submit(tx.signed, send); return { success: true, transaction: tx.signature };
+  const operation = async (journal: { submit: (signed: string, payer: string, send: () => Promise<{ id: string; signature: string }>) => Promise<string> }) => {
+    await journal.submit(tx.signed, 'payer', send); return { success: true, transaction: tx.signature };
   };
   expect(await guardedSettlement(store, tx.first, 'same-request', operation)).toMatchObject({ state: 'UNCERTAIN', signature: tx.signature });
   expect(await guardedSettlement(store, tx.first, 'same-request', operation)).toMatchObject({ state: 'UNCERTAIN', signature: tx.signature });
@@ -40,8 +40,8 @@ test('concurrent calls submit once and return the persisted final result', async
   let release!: () => void;
   const waiting = new Promise<void>(resolve => { release = resolve; });
   const send = jest.fn(async () => { await waiting; return { id: 'relay-1', signature: tx.signature }; });
-  const operation = async (journal: { submit: (signed: string, send: () => Promise<{ id: string; signature: string }>) => Promise<string> }) => {
-    await journal.submit(tx.signed, send); return { success: true, transaction: tx.signature };
+  const operation = async (journal: { submit: (signed: string, payer: string, send: () => Promise<{ id: string; signature: string }>) => Promise<string> }) => {
+    await journal.submit(tx.signed, 'payer', send); return { success: true, transaction: tx.signature };
   };
   const first = guardedSettlement(store, tx.first, 'same-request', operation);
   await new Promise(resolve => setImmediate(resolve));
@@ -55,14 +55,14 @@ test('journal failure prevents submission and signature changes retain the messa
   const tx = fixture(), store = storage(), send = jest.fn();
   expect(settlementKey(tx.first)).toBe(settlementKey(tx.signed));
   store.set = async () => false;
-  await expect(guardedSettlement(store, tx.first, 'same-request', j => j.submit(tx.signed, send))).rejects.toThrow('persist');
+  await expect(guardedSettlement(store, tx.first, 'same-request', j => j.submit(tx.signed, 'payer', send))).rejects.toThrow('persist');
   expect(send).not.toHaveBeenCalled();
 });
 
 test('does not reuse a settlement for different payment requirements', async () => {
   const tx = fixture(), store = storage();
   await guardedSettlement(store, tx.first, 'request-a', async journal => {
-    await journal.submit(tx.signed, async () => ({ id: 'relay', signature: tx.signature }));
+    await journal.submit(tx.signed, 'payer', async () => ({ id: 'relay', signature: tx.signature }));
     return { success: true, transaction: tx.signature };
   });
   await expect(guardedSettlement(store, tx.first, 'request-b', async () => ({}))).rejects.toThrow('requirements');
@@ -70,8 +70,8 @@ test('does not reuse a settlement for different payment requirements', async () 
 
 test('reconciles an uncertain signature without resending', async () => {
   const tx = fixture(), store = storage(), send = jest.fn(async (): Promise<{ id: string; signature: string }> => { throw new Error('lost ACK'); });
-  const op = async (journal: { submit: (signed: string, send: () => Promise<{ id: string; signature: string }>) => Promise<string> }) => {
-    await journal.submit(tx.signed, send); return {};
+  const op = async (journal: { submit: (signed: string, payer: string, send: () => Promise<{ id: string; signature: string }>) => Promise<string> }) => {
+    await journal.submit(tx.signed, 'payer', send); return {};
   };
   await guardedSettlement(store, tx.first, 'req', op);
   const recovered = await guardedSettlement(store, tx.first, 'req', op, async record => {
