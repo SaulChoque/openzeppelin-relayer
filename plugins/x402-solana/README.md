@@ -8,10 +8,13 @@ or settle payments. Do not route production traffic to this qualification plugin
 
 The sponsor adapter signs and sends only through the OpenZeppelin relayer and
 checks that sponsorship preserves the message and external signatures.
-Before enabling settlement, integrate a durable concurrent submission journal
-that records the signed transaction signature before submission, reconciles
-lost acknowledgements and performs post-confirmation CPI verification. Test an
-actual Squads payment end-to-end, then enable support advertising.
+The experimental settlement branch now uses a Redis-backed plugin journal with a
+distributed lock. It records the public transaction signature before submission
+and refuses automatic re-submission after an ambiguous acknowledgement. The
+reference x402 verifier performs post-confirmation CPI verification. An explicit
+plugin flag is required, and it remains disabled in the local configuration.
+Reconciliation of uncertain records and an end-to-end Squads payment are still
+required before advertising settlement. Redis durability must be configured.
 
 Build an isolated test bundle using esbuild with the dependency lockfile:
 
