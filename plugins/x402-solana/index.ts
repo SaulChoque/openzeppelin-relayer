@@ -16,9 +16,22 @@ const USDC = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
  */
 export async function handler({ api, kv, params, route, config }: PluginContext) {
   const settling = route === '/settle';
-  if (route !== '/verify' && !settling) return { isValid: false, invalidReason: 'unsupported_route' };
+  const supported = route === '/supported';
+  if (route !== '/verify' && !settling && !supported) return { isValid: false, invalidReason: 'unsupported_route' };
   if (settling && config?.enableExperimentalSettlement !== true) {
     return { success: false, errorReason: 'settlement_not_available', network: DEVNET, transaction: '', payer: '' };
+  }
+  if (supported) {
+    if (config?.enableExperimentalSettlement !== true) return { kinds: [], extensions: [], signers: {} };
+    const id = config?.relayerId;
+    if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) throw new Error('Solana relayerId required');
+    const response = await api.useRelayer(id).getRelayer();
+    const metadata = (response as any).data ?? response;
+    if (metadata.network_type !== 'solana' || metadata.network !== 'devnet' || metadata.paused !== false || metadata.system_disabled === true) {
+      throw new Error('Active Solana Devnet relayer required');
+    }
+    const feePayer = address(metadata.address);
+    return { kinds: [{ x402Version: 2, scheme: 'exact', network: DEVNET, extra: { feePayer, transactionVersions: [0] } }], extensions: [], signers: { 'solana:*': [feePayer] } };
   }
   const payload = params?.paymentPayload;
   const requirements = params?.paymentRequirements;
