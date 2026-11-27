@@ -29,12 +29,18 @@ FROM cgr.dev/chainguard/wolfi-base@sha256:0a8fd427de5882aed77471b0a432c3675eda6b
 
 WORKDIR /app
 COPY --from=base --chown=nonroot:nonroot /usr/app/bin/openzeppelin-relayer /app/openzeppelin-relayer
-COPY --from=base /usr/lib/libssl.so.3 /usr/lib/libssl.so.3
-COPY --from=base /usr/lib/libcrypto.so.3 /usr/lib/libcrypto.so.3
+# apk's openssl-dev may advance its ABI independently of the pinned Rust image.
+# Ship the actual available ABI libraries rather than assuming OpenSSL 3.
+COPY --from=base /usr/lib/libssl.so.* /usr/lib/
+COPY --from=base /usr/lib/libcrypto.so.* /usr/lib/
 
 ARG NODE_VERSION=20.19
 USER root
 RUN apk add --no-cache nodejs=~${NODE_VERSION} npm
+# Validate the loader closure without running main (and starting queue workers).
+RUN LD_TRACE_LOADED_OBJECTS=1 /app/openzeppelin-relayer > /tmp/relayer-libs \
+ && ! grep -q 'not found' /tmp/relayer-libs \
+ && rm /tmp/relayer-libs
 ENV PATH="/usr/local/bin:$PATH"
 
 # Pin the pnpm major: pnpm 12 ships a preinstall script that newer npm blocks by
